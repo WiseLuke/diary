@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
+const admin = require('firebase-admin');
 require('dotenv').config();
 
 const app = express();
@@ -13,52 +12,30 @@ const MAX_TITLE_LENGTH = 50;
 const MAX_DESCRIPTION_LENGTH = 500;
 const ALLOWED_TAGS = ['업무', '개인', '아이디어', '학습'];
 
-const DATA_DIR_PATH = path.join(__dirname, 'data');
-const DATA_FILE_PATH = path.join(DATA_DIR_PATH, 'tasks.json');
+// Firebase Admin SDK 초기화
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('Firebase Admin SDK가 로컬 서비스 계정 키를 통해 초기화되었습니다.');
+  } catch (error) {
+    console.error('로컬 Firebase 서비스 계정 키 파싱 실패:', error);
+    admin.initializeApp();
+  }
+} else {
+  // Cloud Run 배포 환경에서는 IAM 역할에 의해 자동 인증됨
+  admin.initializeApp();
+  console.log('Firebase Admin SDK가 기본 사용자 인증 정보로 초기화되었습니다.');
+}
+
+const db = admin.firestore();
+const tasksCollection = db.collection('tasks');
 
 // 미들웨어 설정
 app.use(cors());
 app.use(express.json());
-
-/**
- * 데이터 디렉토리 및 파일이 존재하지 않는 경우 초기화하는 함수
- */
-function initializeDatabase() {
-  if (!fs.existsSync(DATA_DIR_PATH)) {
-    fs.mkdirSync(DATA_DIR_PATH, { recursive: true });
-  }
-  if (!fs.existsSync(DATA_FILE_PATH)) {
-    fs.writeFileSync(DATA_FILE_PATH, JSON.stringify([], null, 2), 'utf-8');
-  }
-}
-
-/**
- * 로컬 JSON 파일로부터 작업 데이터를 읽어오는 함수
- * @returns {Array} 작업 목록 배열
- */
-function loadTasksData() {
-  try {
-    initializeDatabase();
-    const fileContent = fs.readFileSync(DATA_FILE_PATH, 'utf-8');
-    return JSON.parse(fileContent);
-  } catch (error) {
-    console.error('데이터를 불러오는 중 에러 발생:', error);
-    return [];
-  }
-}
-
-/**
- * 작업 데이터를 로컬 JSON 파일에 저장하는 함수
- * @param {Array} tasksData 저장할 작업 목록 배열
- */
-function saveTasksData(tasksData) {
-  try {
-    initializeDatabase();
-    fs.writeFileSync(DATA_FILE_PATH, JSON.stringify(tasksData, null, 2), 'utf-8');
-  } catch (error) {
-    console.error('데이터를 저장하는 중 에러 발생:', error);
-  }
-}
 
 /**
  * 외부 입력값을 검증하는 유효성 검사 함수 (글로벌 룰: 안전)
@@ -88,13 +65,25 @@ function validateTaskInput(title, description, tag) {
 // -------------------------------------------------------------
 
 // 1. 모든 작업 목록 조회
-app.get('/api/tasks', (req, res) => {
-  const tasks = loadTasksData();
-  res.json({ success: true, data: tasks });
+app.get('/api/tasks', async (req, res) => {
+  try {
+    const snapshot = await tasksCollection.orderBy('createdAt', 'asc').get();
+    const tasks = [];
+    snapshot.forEach(doc => {
+      tasks.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+    res.json({ success: true, data: tasks });
+  } catch (error) {
+    console.error('작업 목록 조회 중 에러 발생:', error);
+    res.status(500).json({ success: false, message: '데이터베이스 조회 중 에러가 발생했습니다.' });
+  }
 });
 
 // 2. 새 작업 생성
-app.post('/api/tasks', (req, res) => {
+app.post('/api/tasks', async (req, res) => {
   const { title, description, tag } = req.body;
 
   // 글로벌 룰: 외부 입력값 검증 후 처리
@@ -103,80 +92,105 @@ app.post('/api/tasks', (req, res) => {
     return res.status(400).json({ success: false, message: validationError });
   }
 
-  const tasks = loadTasksData();
-  const newTask = {
-    id: Date.now().toString(),
-    title: title.trim(),
-    description: description ? description.trim() : '',
-    tag,
-    isCompleted: false,
-    createdAt: new Date().toISOString()
-  };
+  try {
+    const newTask = {
+      title: title.trim(),
+      description: description ? description.trim() : '',
+      tag,
+      isCompleted: false,
+      createdAt: new Date().toISOString()
+    };
 
-  tasks.push(newTask);
-  saveTasksData(tasks);
+    const docRef = await tasksCollection.add(newTask);
 
-  res.status(201).json({ success: true, data: newTask });
+    res.status(201).json({
+      success: true,
+      data: {
+        id: docRef.id,
+        ...newTask
+      }
+    });
+  } catch (error) {
+    console.error('작업 생성 중 에러 발생:', error);
+    res.status(500).json({ success: false, message: '데이터베이스 저장 중 에러가 발생했습니다.' });
+  }
 });
 
 // 3. 작업 상태 수정 (완료 여부 토글 혹은 내용 수정)
-app.put('/api/tasks/:id', (req, res) => {
+app.put('/api/tasks/:id', async (req, res) => {
   const { id } = req.params;
   const { title, description, tag, isCompleted } = req.body;
-  
-  const tasks = loadTasksData();
-  const taskIndex = tasks.findIndex(item => item.id === id);
 
-  if (taskIndex === -1) {
-    return res.status(404).json({ success: false, message: '해당 작업을 찾을 수 없습니다.' });
-  }
+  try {
+    const docRef = tasksCollection.doc(id);
+    const doc = await docRef.get();
 
-  const currentTask = tasks[taskIndex];
-
-  // 수정할 값이 넘어왔을 경우 유효성 검사 수행
-  if (title !== undefined || description !== undefined || tag !== undefined) {
-    const checkTitle = title !== undefined ? title : currentTask.title;
-    const checkDesc = description !== undefined ? description : currentTask.description;
-    const checkTag = tag !== undefined ? tag : currentTask.tag;
-
-    const validationError = validateTaskInput(checkTitle, checkDesc, checkTag);
-    if (validationError) {
-      return res.status(400).json({ success: false, message: validationError });
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: '해당 작업을 찾을 수 없습니다.' });
     }
 
-    currentTask.title = checkTitle.trim();
-    currentTask.description = checkDesc ? checkDesc.trim() : '';
-    currentTask.tag = checkTag;
-  }
+    const currentTask = doc.data();
+    const updateData = {};
 
-  if (isCompleted !== undefined) {
-    if (typeof isCompleted !== 'boolean') {
-      return res.status(400).json({ success: false, message: '완료 상태값은 Boolean 형태여야 합니다.' });
+    // 수정할 값이 넘어왔을 경우 유효성 검사 수행
+    if (title !== undefined || description !== undefined || tag !== undefined) {
+      const checkTitle = title !== undefined ? title : currentTask.title;
+      const checkDesc = description !== undefined ? description : currentTask.description;
+      const checkTag = tag !== undefined ? tag : currentTask.tag;
+
+      const validationError = validateTaskInput(checkTitle, checkDesc, checkTag);
+      if (validationError) {
+        return res.status(400).json({ success: false, message: validationError });
+      }
+
+      updateData.title = checkTitle.trim();
+      updateData.description = checkDesc ? checkDesc.trim() : '';
+      updateData.tag = checkTag;
     }
-    currentTask.isCompleted = isCompleted;
+
+    if (isCompleted !== undefined) {
+      if (typeof isCompleted !== 'boolean') {
+        return res.status(400).json({ success: false, message: '완료 상태값은 Boolean 형태여야 합니다.' });
+      }
+      updateData.isCompleted = isCompleted;
+    }
+
+    updateData.updatedAt = new Date().toISOString();
+
+    await docRef.update(updateData);
+
+    const updatedDoc = await docRef.get();
+    res.json({
+      success: true,
+      data: {
+        id: updatedDoc.id,
+        ...updatedDoc.data()
+      }
+    });
+  } catch (error) {
+    console.error('작업 수정 중 에러 발생:', error);
+    res.status(500).json({ success: false, message: '데이터베이스 업데이트 중 에러가 발생했습니다.' });
   }
-
-  currentTask.updatedAt = new Date().toISOString();
-  tasks[taskIndex] = currentTask;
-  saveTasksData(tasks);
-
-  res.json({ success: true, data: currentTask });
 });
 
 // 4. 작업 삭제
-app.delete('/api/tasks/:id', (req, res) => {
+app.delete('/api/tasks/:id', async (req, res) => {
   const { id } = req.params;
-  const tasks = loadTasksData();
-  const initialLength = tasks.length;
-  
-  const filteredTasks = tasks.filter(item => item.id !== id);
 
-  if (filteredTasks.length === initialLength) {
-    return res.status(404).json({ success: false, message: '삭제할 작업을 찾을 수 없습니다.' });
+  try {
+    const docRef = tasksCollection.doc(id);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: '삭제할 작업을 찾을 수 없습니다.' });
+    }
+
+    await docRef.delete();
+    res.json({ success: true, message: '작업이 성공적으로 삭제되었습니다.' });
+  } catch (error) {
+    console.error('작업 삭제 중 에러 발생:', error);
+    res.status(500).json({ success: false, message: '데이터베이스 삭제 중 에러가 발생했습니다.' });
   }
-
-  saveTasksData(filteredTasks);
-  res.json({ success: true, message: '작업이 성공적으로 삭제되었습니다.' });
 });
 
 // 서버 구동
